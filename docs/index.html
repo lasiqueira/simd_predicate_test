@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Branchless Conditionals and SIMD: How Many "if"s Can You Do at Once?</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+    <h1>Branchless Conditionals and SIMD</h1>
+    <p>How many "if / else" can a CPU actually do in one instruction?</p>
+</header>
+
+<main>
+<div class="content">
+
+<p>
+    I ran into this same idea three times in completely different contexts before it finally clicked:
+    once in <em>Game Engine Architecture</em> (Jason Gregory), once in a PowerPC-assembly-to-C++
+    decompilation exercise, and again while going through Casey Muratori's
+    <em>Performance-Aware Programming</em> course. This article is my attempt to write down the
+    "aha" moment properly, and to back it up with actual measurements instead of just vibes.
+</p>
+
+<h3>1. A branchy conditional</h3>
+<p>
+    Start with something completely ordinary. <code>f64</code> here is just a <code>double</code> (64 bits):
+</p>
+<pre><code>f64 cond(f64 a, f64 b)
+{
+    return a &lt; b
+        ? a + b
+        : a * b - 2;
+}</code></pre>
+
+<p>
+    With optimizations on, a compiler will often turn this into something that behaves like the
+    branchless version below. (The <code>union</code> is there because C++ doesn't let you apply
+    bitwise operators like <code>&amp;</code>, <code>|</code>, <code>~</code> directly to a
+    <code>double</code> - so we reinterpret its bits through a union instead.)
+</p>
+
+<pre><code>f64 cond2(f64 a, f64 b)
+{
+    union
+    {
+        f64 f;
+        u64 u;
+    } M, T, F, Result;
+
+    M.u = (u64)0 - (u64)(a &lt; b);
+    T.f = a + b;
+    F.f = a * b - 2;
+    Result.u = (M.u & T.u) | (~M.u & F.u);
+    return Result.f;
+}</code></pre>
+
+<p>
+    The interesting part: there is <strong>no branch</strong> in this code at all. You compute the
+    "true" result, you compute the "false" result, and you use a bitmask to pick the correct one.
+    That's the essence of <strong>branchless</strong> programming.
+</p>
+
+<p>
+    In more detail: if the condition is true, <code>M.u</code> becomes
+    <code>0xFFFFFFFFFFFFFFFF</code> (64 one-bits). ANDing that mask with <code>T.u</code> keeps every
+    bit of the true result, while ANDing the <em>inverted</em> mask (all zero-bits) with
+    <code>F.u</code> zeroes out the false result entirely - ORing them together just gives you back
+    <code>T</code>. If the condition is false, it's the exact mirror image: <code>M.u</code> is all
+    zeros, so the true result gets zeroed out and the inverted mask (all ones) passes the false
+    result straight through.
+</p>
+
+<h3>2. Why this unlocks something bigger</h3>
+<p>
+    Once you know an <code>if / else</code> can be expressed purely with bitwise operations and no
+    branch, it opens the door to something much more interesting on modern CPUs.
+</p>
+<p>
+    CPUs have evolved along (at least) two axes since the early days: cache hierarchies, and
+    microarchitecture - specifically, register width. Cache is arguably the single most important
+    topic for anyone writing performance-sensitive code, but that's a subject for another article.
+</p>
+<p>
+    On the register-width side: both x86-64 and ARM grew wider general-purpose registers over time,
+    the same way "the NES is 8-bit, the SNES is 16-bit, the N64 is 64-bit" refers to register/bus
+    width. Desktop and laptop CPUs went through the same evolution. The x86 accumulator is the classic
+    example - it kept the same name lineage while growing wider, staying backwards compatible the
+    whole way:
+</p>
+<table>
+    <thead><tr><th>Register</th><th>Width</th></tr></thead>
+    <tbody>
+        <tr><td>AL / AH</td><td>8 bits</td></tr>
+        <tr><td>AX</td><td>16 bits</td></tr>
+        <tr><td>EAX</td><td>32 bits</td></tr>
+        <tr><td>RAX</td><td>64 bits</td></tr>
+    </tbody>
+</table>
+<p>
+    <em>Aside: one thing that causes real headaches is that the C++ ABI is not stable between Windows
+    and Linux - compiling the same function signature for each platform can put parameters and
+    return values in different registers entirely.</em>
+</p>
+<p>
+    A <code>double</code> is 64 bits, which is already one of the widest primitive types you'll use
+    day to day. But CPUs also have a separate family of registers built specifically for vector /
+    SIMD work, wide enough to hold <em>several</em> 64-bit values at once. These are <strong>not</strong>
+    a continuation of the AL/AX/EAX/RAX lineage - they're an entirely separate register file:
+</p>
+<table>
+    <thead><tr><th>Register</th><th>Width</th></tr></thead>
+    <tbody>
+        <tr><td>XMM</td><td>128 bits</td></tr>
+        <tr><td>YMM</td><td>256 bits</td></tr>
+        <tr><td>ZMM</td><td>512 bits (rarer on personal machines - needs AVX-512)</td></tr>
+    </tbody>
+</table>
+<p>
+    Base SSE/AVX only give you 16 of these (XMM0-XMM15 / YMM0-YMM15). It's specifically AVX-512's
+    encoding scheme that extends the register file to 32 (XMM0-31 / YMM0-31 / ZMM0-31).
+</p>
+
+<h3>3. Scaling the branchless trick across lanes</h3>
+<p>
+    Here's the payoff: since a "return if / else" can be expressed as pure bit manipulation, you can
+    do <strong>N of them at once</strong>, where N depends on how wide your registers are and how
+    small your data type is.
+</p>
+<p>
+    With <code>double</code>s: XMM gets you 2 at a time, YMM gets you 4, ZMM gets you 8. Switch to a
+    single byte (<code>uint8_t</code> / <code>char</code>) instead, and the same 512-bit register
+    can carry out <strong>64</strong> of these conditionals in one instruction:
+</p>
+<table>
+    <thead><tr><th>Type</th><th>Bits</th><th>XMM (128)</th><th>YMM (256)</th><th>ZMM (512)</th></tr></thead>
+    <tbody>
+        <tr><td>double / uint64_t</td><td>64</td><td>2</td><td>4</td><td>8</td></tr>
+        <tr><td>float / uint32_t</td><td>32</td><td>4</td><td>8</td><td>16</td></tr>
+        <tr><td>uint16_t</td><td>16</td><td>8</td><td>16</td><td>32</td></tr>
+        <tr><td>uint8_t (char)</td><td>8</td><td>16</td><td>32</td><td>64</td></tr>
+    </tbody>
+</table>
+<p>
+    A compiler can sometimes auto-vectorize code like this on its own (more on exactly how reliable
+    that is later), but writing it by hand with intrinsics guarantees it - including in unoptimized
+    debug builds, where auto-vectorization never happens at all. That's what <code>&lt;immintrin.h&gt;</code>
+    is for.
+</p>
+
+<h4>256-bit (4 doubles at a time)</h4>
+<pre><code>__m256d cond256(__m256d a, __m256d b)
+{
+    __m256d mask = _mm256_cmp_pd(a, b, _CMP_LT_OQ);
+
+    __m256d t = _mm256_add_pd(a, b);
+    __m256d f = _mm256_sub_pd(
+        _mm256_mul_pd(a, b),
+        _mm256_set1_pd(2.0)
+    );
+
+    return _mm256_blendv_pd(f, t, mask);
+}</code></pre>
+
+<h4>512-bit (8 doubles at a time)</h4>
+<pre><code>__m512d cond512(__m512d a, __m512d b)
+{
+    __mmask8 mask = _mm512_cmp_pd_mask(a, b, _CMP_LT_OQ);
+
+    __m512d result = _mm512_sub_pd(
+        _mm512_mul_pd(a, b),
+        _mm512_set1_pd(2.0)
+    );
+
+    return _mm512_mask_add_pd(result, mask, a, b);
+}</code></pre>
+
+<p>
+    AVX-512 also introduces dedicated <strong>mask registers</strong> (<code>__mmask8</code> here -
+    one bit per 64-bit lane in a 512-bit register), which make this even more efficient. Instead of
+    computing both results and blending them with a separate instruction, the mask is built once from
+    <code>a[i] &lt; b[i]</code> (one bit set per lane where it's true), and then folded directly into
+    the arithmetic: <code>result</code> starts out holding the "false" answer
+    (<code>a * b - 2</code>) for all 8 lanes, and <code>_mm512_mask_add_pd</code> overwrites
+    <em>only</em> the lanes where the mask bit is set with <code>a + b</code> - so for a mask like
+    <code>T F F T T F F T</code>, lanes 0, 3, 4 and 7 get replaced with <code>a + b</code>, and the
+    rest keep the value already computed for the false case.
+</p>
+
+<p>
+    Of course, to actually feed these functions you need to load your data into the wide types too:
+</p>
+<pre><code>std::vector&lt;f64&gt; lp512(std::vector&lt;f64&gt;& a, f64 b)
+{
+    std::vector&lt;f64&gt; res(a.size());
+
+    __m512d wide_b = _mm512_set1_pd(b);
+
+    for (size_t i = 0; i &lt; a.size(); i += 8)
+    {
+        __m512d packed = _mm512_loadu_pd(&a[i]);
+        __m512d condRes = cond512(packed, wide_b);
+        _mm512_storeu_pd(&res[i], condRes);
+    }
+
+    return res;
+}</code></pre>
+
+<h3>4. Taking it further: 64 conditionals per instruction</h3>
+<p>
+    Since the number of lanes scales inversely with element size, swapping <code>double</code> for
+    <code>uint8_t</code> gets you from 8 lanes to 64 lanes in the same 512-bit register. The catch:
+    <code>a + b</code> and <code>a * b - 2</code> overflow trivially in an 8-bit range, and there's no
+    native 8-bit SIMD multiply to begin with. The fix is to swap the arithmetic for
+    <strong>saturating</strong> add/sub (clamped at 0/255 instead of wrapping), which is a real
+    hardware feature for 8-bit lanes:
+</p>
+<pre><code>u8 cond2(u8 a, u8 b)
+{
+    u8 mask = (u8)0 - (u8)(a &lt; b);
+    u8 trueRes = sat_add_u8(a, b);
+    u8 falseRes = sat_sub_u8(sat_sub_u8(a, b), 2);
+    return (u8)((mask & trueRes) | (~mask & falseRes));
+}
+
+__m512i cond512(__m512i a, __m512i b)
+{
+    __mmask64 mask = _mm512_cmp_epu8_mask(a, b, _MM_CMPINT_LT);
+
+    __m512i falseRes = _mm512_subs_epu8(
+        _mm512_subs_epu8(a, b),
+        _mm512_set1_epi8(2)
+    );
+
+    return _mm512_mask_adds_epu8(falseRes, mask, a, b);
+}</code></pre>
+<p>
+    Same shape as before - build a mask, compute the false case, mask-overwrite with the true case -
+    just now with a <code>__mmask64</code> (one bit per byte lane) doing 64 conditionals per
+    instruction instead of 8.
+</p>
+
+<h3>5. Does it actually matter in practice?</h3>
+<p>
+    Talk is cheap, so this was measured: a 10,000,000-byte buffer, processed by a genuinely scalar
+    loop, an AVX2 loop (32 lanes), and an AVX-512 loop (64 lanes), each run repeatedly for a few
+    seconds and tracking the true minimum time (via a repetition tester built on <code>RDTSC</code>),
+    on an AMD Ryzen 7 7800X3D. Both buffers were backed by Windows large pages and pre-touched, and
+    the result buffers were pre-allocated outside the timed region, so the numbers below measure only
+    the compute loop itself - no allocation, no page faults, no memory bandwidth surprises from cold
+    memory.
+</p>
+<table>
+    <thead><tr><th>Implementation</th><th>Min time</th><th>Throughput</th><th>Bandwidth</th></tr></thead>
+    <tbody>
+        <tr><td>Scalar (MSVC, genuinely scalar)</td><td>31.47 ms</td><td>0.32 GOp/s</td><td>0.30 GB/s</td></tr>
+        <tr><td>AVX2 (32 lanes)</td><td>0.176 ms</td><td>56.9 GOp/s</td><td>53.0 GB/s</td></tr>
+        <tr><td>AVX-512 (64 lanes)</td><td>0.174 ms</td><td>57.5 GOp/s</td><td>53.6 GB/s</td></tr>
+    </tbody>
+</table>
+<p>
+    Scalar to AVX2: roughly <strong>179x</strong> faster. Scalar to AVX-512: roughly <strong>181x</strong>.
+    AVX2 to AVX-512 is basically a wash here (~1%). Part of the explanation is this specific CPU:
+    Zen 4 (including the 7800X3D) implements AVX-512 by internally splitting each 512-bit operation
+    into two 256-bit micro-ops ("double pumped") - full native 512-bit execution units didn't arrive
+    until Zen 5, so a 512-bit op doesn't get twice the ALU work done per cycle the way you might
+    expect. But that alone doesn't fully explain a ~1% difference (as section 6 will show, AVX-512
+    does have a real edge once you isolate it) - the bigger factor here is that this particular
+    workload (10MB in, 10MB out) is bound by L3 cache/store bandwidth rather than compute once
+    vectorized at all (this CPU's 96MB 3D V-Cache comfortably holds the whole working set, so it
+    never touches DRAM), which swamps any compute-side difference between the two. A good reminder
+    that "wider SIMD" only pays off up to whatever the next bottleneck happens to be - and right now,
+    for this data size, that bottleneck is memory, not the ALU.
+</p>
+
+<p>
+    The same setup run across all six types (10,000,000 elements each, so the byte footprint grows
+    with element width - 10MB for <code>u8</code> up to 80MB for <code>u64</code>/<code>f64</code>):
+</p>
+<table>
+    <thead><tr><th>Type</th><th>Scalar</th><th>AVX2</th><th>AVX-512</th></tr></thead>
+    <tbody>
+        <tr><td>u8</td><td>0.79 GOp/s</td><td>58.6 GOp/s</td><td>58.5 GOp/s</td></tr>
+        <tr><td>u16</td><td>1.94 GOp/s</td><td>29.1 GOp/s</td><td>29.0 GOp/s</td></tr>
+        <tr><td>u32</td><td>14.4 GOp/s</td><td>14.6 GOp/s</td><td>13.8 GOp/s</td></tr>
+        <tr><td>u64</td><td>3.78 GOp/s</td><td>3.78 GOp/s</td><td>3.93 GOp/s</td></tr>
+        <tr><td>f32</td><td>1.56 GOp/s</td><td>14.4 GOp/s</td><td>13.9 GOp/s</td></tr>
+        <tr><td>f64</td><td>1.56 GOp/s</td><td>3.67 GOp/s</td><td>3.84 GOp/s</td></tr>
+    </tbody>
+</table>
+
+<p>
+    Notice AVX-512 isn't just tied with AVX2 here for the wider types - it's occasionally a hair
+    <em>slower</em> (<code>u32</code>, <code>f32</code>). Is that the double-pumping, or the
+    <code>k</code>-mask register overhead, or something else? Hard to tell while memory bandwidth is
+    the dominant cost - so the next step is removing memory bandwidth from the picture entirely.
+</p>
+
+<h3>6. Taking memory bandwidth out of the equation</h3>
+<p>
+    All of the numbers above are moving 10MB-80MB per run - well past L1 (32KB) and L2, and for the
+    wider types past this CPU's 96MB L3 too. To isolate pure compute/instruction throughput, the
+    fix is to shrink the buffer down to something that fits entirely in L1D and process the exact
+    same bytes over and over (4KB, looped 4096 times per timed sample) - so every access after the
+    first is served straight out of L1, and memory bandwidth simply can't be the bottleneck anymore:
+</p>
+<table>
+    <thead><tr><th>Type</th><th>Scalar</th><th>AVX2</th><th>AVX-512</th><th>AVX-512 vs AVX2</th></tr></thead>
+    <tbody>
+        <tr><td>u8</td><td>0.80 GOp/s</td><td>77.8 GOp/s</td><td>80.7 GOp/s</td><td>+4%</td></tr>
+        <tr><td>u16</td><td>1.98 GOp/s</td><td>38.9 GOp/s</td><td>58.0 GOp/s</td><td>+49%</td></tr>
+        <tr><td>u32</td><td>17.6 GOp/s</td><td>19.2 GOp/s</td><td>29.3 GOp/s</td><td>+52%</td></tr>
+        <tr><td>u64</td><td>8.86 GOp/s</td><td>9.71 GOp/s</td><td>14.1 GOp/s</td><td>+46%</td></tr>
+        <tr><td>f32</td><td>1.60 GOp/s</td><td>18.9 GOp/s</td><td>34.0 GOp/s</td><td>+79%</td></tr>
+        <tr><td>f64</td><td>1.61 GOp/s</td><td>9.41 GOp/s</td><td>17.3 GOp/s</td><td>+84%</td></tr>
+    </tbody>
+</table>
+<p>
+    Once memory stops being the bottleneck, AVX-512 clearly and consistently beats AVX2 across every
+    type - the near-tie (or occasional loss) in the large-buffer table really was memory bandwidth
+    masking a genuine compute advantage. That said, the gains for <code>u32</code>/<code>u64</code>/
+    <code>f32</code>/<code>f64</code> (+46% to +84%) are bigger than "double-pumping" alone should
+    allow: if a 512-bit op genuinely cost exactly 2x a 256-bit op in execution, processing 2x the
+    data per instruction should net out to roughly the <em>same</em> throughput, not a 50-80% win.
+    The likely explanation is that double-pumping caps the execution-port throughput, but halving the
+    number of instructions issued still halves other per-instruction costs that don't double-pump -
+    loop overhead, decode/issue bandwidth, branch counting - and that's apparently worth a lot on this
+    core. <code>u8</code>, by contrast, only gains a modest +4%, because its speedup was never coming
+    from extra lanes in the first place at this width - it comes from the masked-fusion trick from
+    section 3 (folding the select into the arithmetic instruction itself, saving one instruction
+    versus AVX2's separate blend), which is a smaller, more specific win than the broader per-instruction
+    overhead savings the wider types get. Take the precise split between these two effects with a grain
+    of salt without deeper microarchitectural profiling (e.g. counting actual retired instructions/uops)
+    - but the direction is clear either way: AVX-512 is a real win here, just not a clean "2x the lanes,
+    2x the speed" one.
+</p>
+
+<h3>7. Can't the compiler just do this for me?</h3>
+<p>
+    Sometimes - and it's worth knowing exactly when. Disassembling both builds of this exact
+    benchmark turned up a real difference between compilers:
+</p>
+<ul>
+    <li>
+        <strong>MSVC (<code>cl</code>)</strong> compiled the plain scalar <code>cond2</code> loop
+        completely literally: one byte per iteration, plain general-purpose registers, no
+        vectorization at all.
+    </li>
+    <li>
+        <strong>clang-cl</strong>, at the same optimization level, recognized the branchless
+        mask/add/sub pattern in that same scalar loop and auto-vectorized it into real 4-way-unrolled
+        AVX-512 code - despite nothing in the source calling a single intrinsic.
+    </li>
+</ul>
+<p>
+    Both are "correct" - but it means benchmarking "scalar" performance under clang-cl wasn't actually
+    measuring scalar performance at all. This is exactly the trap: auto-vectorization is real and can
+    be impressive, but it's also not guaranteed, and it's sensitive to how the loop is written.
+    In more complex codebases - loops with unclear pointer aliasing, function calls the optimizer
+    can't see through, non-trivial control flow, or arithmetic that doesn't have a clean saturating/
+    wrapping equivalent - the same auto-vectorizer can and does silently fail to vectorize, with no
+    warning at all unless you go looking at the disassembly. Writing the intrinsics by hand is the
+    only way to <em>guarantee</em> the vectorized path, in every build configuration, on every
+    compiler.
+</p>
+<p>
+    One caveat about this benchmark's own setup: each implementation is called through a function
+    pointer rather than directly by name (necessary to stop the repeated calls in the timed loop from
+    being optimized away entirely - a loop calling the same pure function on the same unchanged data
+    is otherwise a legitimate target for the compiler to collapse down to one iteration). That
+    indirection adds a small, likely negligible, per-call overhead versus a direct/inlined call - but
+    it doesn't change whether a given loop gets auto-vectorized, since that decision is made when the
+    function itself is compiled, not at the call site. Disassembling the standalone <code>lp()</code>
+    confirms this directly: it's vectorized into AVX-512 by clang-cl exactly as described above, even
+    though it's only ever invoked indirectly here.
+</p>
+
+<h3>References</h3>
+<ul>
+    <li><a href="https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html" target="_blank" rel="noopener">Intel Intrinsics Guide</a></li>
+    <li><a href="https://www.computerenhance.com/" target="_blank" rel="noopener">Computer Enhance - Performance-Aware Programming (Casey Muratori)</a></li>
+    <li><a href="https://www.gameenginebook.com/" target="_blank" rel="noopener">Game Engine Architecture (Jason Gregory)</a></li>
+    <li><a href="https://decomp-academy.dev/" target="_blank" rel="noopener">Decomp Academy</a> - PowerPC decompilation exercises</li>
+</ul>
+
+</div>
+</main>
+
+<footer>
+    <p>simd_predicate_test</p>
+</footer>
+
+</body>
+</html>
