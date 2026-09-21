@@ -36,7 +36,7 @@ inline u8 condScalar(u8 a, u8 b)
 }
 
 
-inline u8 condScalarBin(u8 a, u8 b)
+inline u8 condScalarBitmask(u8 a, u8 b)
 {
     u8 mask = (u8)0 - (u8)(a < b);
     u8 trueRes = sat_add_u8(a, b);
@@ -79,7 +79,7 @@ inline void lpScalar(const u8* __restrict a, size_t n, u8 b, u8* __restrict res)
 inline void lpScalarBin(const u8* __restrict a, size_t n, u8 b, u8* __restrict res)
 {
     for (size_t i = 0; i < n; ++i)
-        res[i] = condScalarBin(a[i], b);
+        res[i] = condScalarBitmask(a[i], b);
 }
 
 inline void lp256(const u8* __restrict a, size_t n, u8 b, u8* __restrict res)
@@ -119,7 +119,7 @@ inline T condScalar(T a, T b)
 }
 
 template <typename T>
-inline T condScalarBin(T a, T b)
+inline T condScalarBitmask(T a, T b)
 {
     T mask = (T)0 - (T)(a < b);
     T trueRes = (T)(a + b);
@@ -129,7 +129,7 @@ inline T condScalarBin(T a, T b)
 
 // floats can't use bitwise ops directly (not defined by the language for float/double), so these
 // reinterpret the bits through a union instead - same mask/select shape as the integer template.
-inline f64 condScalarBin(f64 a, f64 b)
+inline f64 condScalarBitmask(f64 a, f64 b)
 {
     union { f64 f; u64 u; } M, T, F, Result;
     M.u = (u64)0 - (u64)(a < b);
@@ -139,7 +139,7 @@ inline f64 condScalarBin(f64 a, f64 b)
     return Result.f;
 }
 
-inline f32 condScalarBin(f32 a, f32 b)
+inline f32 condScalarBitmask(f32 a, f32 b)
 {
     union { f32 f; u32 u; } M, T, F, Result;
     M.u = (u32)0 - (u32)(a < b);
@@ -238,7 +238,7 @@ template <typename T>
 inline void lp2(const T* __restrict a, size_t n, T b, T* __restrict res)
 {
     for (size_t i = 0; i < n; ++i)
-        res[i] = condScalarBin(a[i], b);
+        res[i] = condScalarBitmask(a[i], b);
 }
 
 inline __m256i cond256_u16(__m256i a, __m256i b)
@@ -367,7 +367,7 @@ void RunTypeBenchmark(
     T minA,
     T maxA,
     void (*fnScalar)(const T* __restrict, size_t, T, T* __restrict),
-    void (*fnScalarBin)(const T* __restrict, size_t, T, T* __restrict),
+    void (*fnScalarBitmask)(const T* __restrict, size_t, T, T* __restrict),
     void (*fn256)(const T* __restrict, size_t, T, T* __restrict),
     void (*fn512)(const T* __restrict, size_t, T, T* __restrict),
     uint64_t cpu_freq,
@@ -405,7 +405,7 @@ void RunTypeBenchmark(
     RepetitionTester avx2Tester = {};
     RepetitionTester avx512Tester = {};
 
-    printf("--- %s scalar ---\n", typeName);
+    printf("--- %s scalar (if/else) ---\n", typeName);
     NewTestWave(scalarTester, sampleBytes, cpu_freq, seconds_per_wave);
     while (IsTesting(scalarTester))
     {
@@ -417,13 +417,13 @@ void RunTypeBenchmark(
         CountOps(scalarTester, elementCount * repeatsPerSample);
     }
 
-    printf("--- %s scalar bin ---\n", typeName);
+    printf("--- %s scalar (bitmask) ---\n", typeName);
     NewTestWave(scalarBinTester, sampleBytes, cpu_freq, seconds_per_wave);
     while (IsTesting(scalarBinTester))
     {
         BeginTime(scalarBinTester);
         for (size_t r = 0; r < repeatsPerSample; ++r)
-            fnScalarBin(v, elementCount, b, res2);
+            fnScalarBitmask(v, elementCount, b, res2);
         EndTime(scalarBinTester);
         CountBytes(scalarBinTester, sampleBytes);
         CountOps(scalarBinTester, elementCount * repeatsPerSample);
@@ -460,7 +460,7 @@ void RunTypeBenchmark(
         {
             allMatch = false;
             printf(
-                "%zu: scalar = %llu, scalar bin = %llu, AVX2 = %llu, AVX512 = %llu\n",
+                "%zu: scalar (if/else) = %llu, scalar (bitmask) = %llu, AVX2 = %llu, AVX512 = %llu\n",
                 i, (unsigned long long)res1[i], (unsigned long long)res2[i], (unsigned long long)res3[i], (unsigned long long)res4[i]
             );
         }
