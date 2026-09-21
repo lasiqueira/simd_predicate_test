@@ -255,13 +255,13 @@ __m512i cond512(__m512i a, __m512i b)
 <table>
     <thead><tr><th>Implementation</th><th>Min time</th><th>Throughput</th><th>Bandwidth</th></tr></thead>
     <tbody>
-        <tr><td>Scalar (MSVC, genuinely scalar)</td><td>31.47 ms</td><td>0.32 GOp/s</td><td>0.30 GB/s</td></tr>
+        <tr><td>Scalar (bitmask) (MSVC, genuinely scalar)</td><td>31.47 ms</td><td>0.32 GOp/s</td><td>0.30 GB/s</td></tr>
         <tr><td>AVX2 (32 lanes)</td><td>0.176 ms</td><td>56.9 GOp/s</td><td>53.0 GB/s</td></tr>
         <tr><td>AVX-512 (64 lanes)</td><td>0.174 ms</td><td>57.5 GOp/s</td><td>53.6 GB/s</td></tr>
     </tbody>
 </table>
 <p>
-    Scalar to AVX2: roughly <strong>179x</strong> faster. Scalar to AVX-512: roughly <strong>181x</strong>.
+    Scalar (bitmask) to AVX2: roughly <strong>179x</strong> faster. Scalar (bitmask) to AVX-512: roughly <strong>181x</strong>.
     AVX2 to AVX-512 is basically a wash here (~1%). Part of the explanation is this specific CPU:
     Zen 4 (including the 7800X3D) implements AVX-512 by internally splitting each 512-bit operation
     into two 256-bit micro-ops ("double pumped") - full native 512-bit execution units didn't arrive
@@ -280,7 +280,7 @@ __m512i cond512(__m512i a, __m512i b)
     with element width - 10MB for <code>u8</code> up to 80MB for <code>u64</code>/<code>f64</code>):
 </p>
 <table>
-    <thead><tr><th>Type</th><th>Scalar</th><th>AVX2</th><th>AVX-512</th></tr></thead>
+    <thead><tr><th>Type</th><th>Scalar (bitmask)</th><th>AVX2</th><th>AVX-512</th></tr></thead>
     <tbody>
         <tr><td>u8</td><td>0.79 GOp/s</td><td>58.6 GOp/s</td><td>58.5 GOp/s</td></tr>
         <tr><td>u16</td><td>1.94 GOp/s</td><td>29.1 GOp/s</td><td>29.0 GOp/s</td></tr>
@@ -307,7 +307,7 @@ __m512i cond512(__m512i a, __m512i b)
     first is served straight out of L1, and memory bandwidth simply can't be the bottleneck anymore:
 </p>
 <table>
-    <thead><tr><th>Type</th><th>Scalar</th><th>AVX2</th><th>AVX-512</th><th>AVX-512 vs AVX2</th></tr></thead>
+    <thead><tr><th>Type</th><th>Scalar (bitmask)</th><th>AVX2</th><th>AVX-512</th><th>AVX-512 vs AVX2</th></tr></thead>
     <tbody>
         <tr><td>u8</td><td>0.80 GOp/s</td><td>77.8 GOp/s</td><td>80.7 GOp/s</td><td>+4%</td></tr>
         <tr><td>u16</td><td>1.98 GOp/s</td><td>38.9 GOp/s</td><td>58.0 GOp/s</td><td>+49%</td></tr>
@@ -344,19 +344,19 @@ __m512i cond512(__m512i a, __m512i b)
 </p>
 <ul>
     <li>
-        <strong>MSVC (<code>cl</code>)</strong> compiled the plain scalar <code>cond2</code> loop
+        <strong>MSVC (<code>cl</code>)</strong> compiled the plain scalar (bitmask) <code>condScalarBitmask</code> loop
         completely literally: one byte per iteration, plain general-purpose registers, no
         vectorization at all.
     </li>
     <li>
         <strong>clang-cl</strong>, at the same optimization level, recognized the branchless
         mask/add/sub pattern in that same scalar loop and auto-vectorized it into real 4-way-unrolled
-        AVX-512 code - despite nothing in the source calling a single intrinsic.
+        AVX-512 code - despite nothing in the source calling a single intrinsic in <code>condScalarBitmask</code>.
     </li>
 </ul>
 <p>
-    Both are "correct" - but it means benchmarking "scalar" performance under clang-cl wasn't actually
-    measuring scalar performance at all. This is exactly the trap: auto-vectorization is real and can
+    Both are "correct" - but it means benchmarking "scalar (bitmask)" performance under clang-cl wasn't actually
+    measuring scalar (bitmask) performance at all. This is exactly the trap: auto-vectorization is real and can
     be impressive, but it's also not guaranteed, and it's sensitive to how the loop is written.
     In more complex codebases - loops with unclear pointer aliasing, function calls the optimizer
     can't see through, non-trivial control flow, or arithmetic that doesn't have a clean saturating/
@@ -376,7 +376,55 @@ __m512i cond512(__m512i a, __m512i b)
     confirms this directly: it's vectorized into AVX-512 by clang-cl exactly as described above, even
     though it's only ever invoked indirectly here.
 </p>
+<h4>7.1. What happens with the ordinary if / else?</h4>
+<p>
+    The previous comparison specifically used the scalar bitmask implementation. I initially interpreted 
+    the results as evidence that MSVC wasn't able to auto-vectorize this workload, but that's not quite right. 
+    Re-running the benchmark with the original if / else conditional shows that MSVC can auto-vectorize the 
+    ordinary scalar version to AVX-512 as well.
+</p>
+<p>
+    The exact result depends on the type and workload, but the important point is that the compiler is capable 
+    of recognizing the higher-level conditional directly. The explicit bitmask isn't necessary to make SIMD possible; 
+    its purpose here is primarily to illustrate the predicate → mask → select model that underlies SIMD programming.
+</p>
 
+<h4>7.2. Ordinary <code>if / else</code> vs explicit bitmask</h4>
+
+<p> 
+    The following results use the ordinary scalar <code>if / else</code> implementation rather than the explicit bitmask 
+    version used in the original experiment. The important detail is that "scalar" here describes the source code, not necessarily 
+    the generated machine code: MSVC can auto-vectorize this loop, including into AVX-512. 
+</p>
+
+<h5>Large buffer</h5>
+
+<table> 
+    <thead> <tr> <th>Type</th> <th>Scalar (if / else)</th> <th>Scalar (bitmask)</th> <th>AVX2</th> <th>AVX-512</th> </tr> </thead> 
+    <tbody> 
+        <tr> <td>u8</td> <td>0.4151 GOp/s</td> <td>0.9019 GOp/s</td> <td>56.4509 GOp/s</td> <td>61.5216 GOp/s</td> </tr> 
+        <tr> <td>u16</td> <td>29.4638 GOp/s</td> <td>2.0815 GOp/s</td> <td>27.9290 GOp/s</td> <td>28.7191 GOp/s</td> </tr> 
+        <tr> <td>u32</td> <td>14.8591 GOp/s</td> <td>12.3368 GOp/s</td> <td>13.8625 GOp/s</td> <td>13.8662 GOp/s</td> </tr> 
+        <tr> <td>u64</td> <td>3.9948 GOp/s</td> <td>3.8760 GOp/s</td> <td>3.8305 GOp/s</td> <td>3.9824 GOp/s</td> </tr> 
+        <tr> <td>f32</td> <td>14.7589 GOp/s</td> <td>1.5781 GOp/s</td> <td>14.0778 GOp/s</td> <td>15.0435 GOp/s</td> </tr> 
+        <tr> <td>f64</td> <td>3.9828 GOp/s</td> <td>1.5302 GOp/s</td> <td>3.7557 GOp/s</td> <td>3.8315 GOp/s</td> </tr> 
+    </tbody> 
+</table>
+
+<h5>L1-resident</h5>
+
+<table> <thead> <tr> <th>Type</th> <th>Scalar (if / else)</th> <th>Scalar (bitmask)</th> <th>AVX2</th> <th>AVX-512</th> </tr> </thead> 
+    <tbody> 
+        <tr> <td>u8</td> <td>1.6194 GOp/s</td> <td>0.8852 GOp/s</td> <td>74.3551 GOp/s</td> <td>79.0982 GOp/s</td> </tr> 
+        <tr> <td>u16</td> <td>51.1767 GOp/s</td> <td>2.3655 GOp/s</td> <td>37.4665 GOp/s</td> <td>57.2585 GOp/s</td> </tr> 
+        <tr> <td>u32</td> <td>27.3736 GOp/s</td> <td>17.4293 GOp/s</td> <td>18.7651 GOp/s</td> <td>28.8320 GOp/s</td> </tr> 
+        <tr> <td>u64</td> <td>13.7668 GOp/s</td> <td>8.7616 GOp/s</td> <td>9.3779 GOp/s</td> <td>14.3538 GOp/s</td> </tr> 
+        <tr> <td>f32</td> <td>28.2361 GOp/s</td> <td>1.6107 GOp/s</td> <td>22.3690 GOp/s</td> <td>33.9748 GOp/s</td> </tr> 
+        <tr> <td>f64</td> <td>14.0040 GOp/s</td> <td>1.6237 GOp/s</td> <td>11.3295 GOp/s</td> <td>16.9626 GOp/s</td> </tr> 
+    </tbody> 
+</table>
+
+<p> <em>Throughput in GOp/s; higher is better. The exact results depend on compiler, CPU, workload size, and generated code.</em> </p>
 <h3>References</h3>
 <ul>
     <li><a href="https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html" target="_blank" rel="noopener">Intel Intrinsics Guide</a></li>

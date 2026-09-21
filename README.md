@@ -43,7 +43,7 @@ optimizing anything away" discussion in the article for how that was verified.
 
 ### Large buffer (10,000,000 elements, memory-bandwidth-bound for the wider types)
 
-| Type | Scalar | AVX2 | AVX-512 |
+| Type | Scalar (bitmask) | AVX2 | AVX-512 |
 |---|---|---|---|
 | u8  | 0.79 GOp/s | 58.6 GOp/s | 58.5 GOp/s |
 | u16 | 1.94 GOp/s | 29.1 GOp/s | 29.0 GOp/s |
@@ -54,7 +54,7 @@ optimizing anything away" discussion in the article for how that was verified.
 
 ### L1-resident (4KB buffer, looped 4096 times per sample - compute-bound, no memory bandwidth)
 
-| Type | Scalar | AVX2 | AVX-512 | AVX-512 vs AVX2 |
+| Type | Scalar (bitmask)| AVX2 | AVX-512 | AVX-512 vs AVX2 |
 |---|---|---|---|---|
 | u8  | 0.80 GOp/s | 77.8 GOp/s | 80.7 GOp/s | +4% |
 | u16 | 1.98 GOp/s | 38.9 GOp/s | 58.0 GOp/s | +49% |
