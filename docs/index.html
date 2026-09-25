@@ -73,6 +73,26 @@
     result straight through.
 </p>
 
+<div class="note">
+<p>
+    <strong>A caveat worth being precise about:</strong> reading a union member other than the one
+    most recently written - which is exactly what <code>Result.f</code> does after
+    <code>Result.u</code> was set - is undefined behavior per the C++ standard, even though it's a
+    very common pattern and GCC, Clang, and MSVC all explicitly document it as a supported
+    extension. It's not the union itself that's the point of this article; it's the mask-and-select
+    mechanism. If you'd rather have the exact same trick with no standard-based caveat at all, apply
+    it to an integer type instead - <code>&amp;</code>, <code>|</code>, and <code>~</code> work
+    directly on it, no reinterpretation required:
+</p>
+<pre><code>u64 cond2(u64 a, u64 b)
+{
+    u64 mask     = (u64)0 - (u64)(a &lt; b);
+    u64 trueRes  = a + b;
+    u64 falseRes = a * b - 2;
+    return (mask &amp; trueRes) | (~mask &amp; falseRes);
+}</code></pre>
+</div>
+
 <h3>2. Why this unlocks something bigger</h3>
 <p>
     Once you know an <code>if / else</code> can be expressed purely with bitwise operations and no
